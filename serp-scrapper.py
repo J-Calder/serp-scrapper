@@ -1,161 +1,170 @@
-import requests
-import csv
+import os
+import asyncio
+import aiohttp
+import json
 from bs4 import BeautifulSoup
-import nltk
-from nltk.collocations import BigramAssocMeasures, BigramCollocationFinder
-from nltk.corpus import stopwords
-from collections import defaultdict
-from langdetect import detect
+from dotenv import load_dotenv
 from pymongo import MongoClient
+import pandas as pd
+import openai
+import sys
 
-nltk.download('punkt')
-nltk.download('stopwords')
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+load_dotenv()
+os.environ["OPENAI_API_KEY"] = "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"
 
 client = MongoClient('mongodb://localhost:27017/')
 db = client['scraped_data']
+db = client['chatgpt_data']
 scraped_data_collection = db['scraped_data']
-new_data_collection = db['new_data']
+chatgpt_data_collection = db['chatgpt_data']
 
-def detect_language(text):
+async def analyze_text_with_chatgpt(session, text):
+    print("Analyzing text with ChatGPT...")
+    prompt = f"Extract keywords from the following paragraph:\n\n{text}\n\nKeywords:"
+
     try:
-        return detect(text)
-    except:
-        return 'unknown'
+        async with session.post(
+            "https://api.openai.com/v1/engines/text-davinci-003/completions",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
+            },
+            json={
+                "prompt": prompt,
+                "max_tokens": 100,
+                "n": 1,
+                "stop": None,
+                "temperature": 0.7,
+            },
+        ) as response:
+            response_data = await response.json()
+            if 'choices' not in response_data:
+                print(f"Unexpected API response: {response_data}")
+                return []
+            keywords = response_data["choices"][0]["text"].strip()
+            return keywords.split(", ")
 
-def scrape_search_results(query, num_results=10):
-    titles = []
-    subheaders = []
-    headings = []
+    except Exception as e:
+        print(f"Error analyzing text: {e}")
+        return []
 
-    for start in range(0, num_results, 10):
-        url = f'https://www.google.com/search?q={query}&start={start}'
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
-        }
-        response = requests.get(url, headers=headers)
-        soup = BeautifulSoup(response.text, 'html.parser')
+async def fetch(session, url, headers):
+    async with session.get(url, headers=headers, ssl=False) as response:
+        return await response.text()
 
-        search_results = soup.select('.tF2Cxc')
+async def scrape_search_results(query, num_results):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
+    }
 
-        for result in search_results:
-            title = result.select_one('.LC20lb.DKV0Md').get_text(strip=True)
-            titles.append(title)
+    data = []
 
-            subheader = result.select_one('.VwiC3b.yXK7lf.MUxGbd.yDYNvb.lyLwlc')
-            if subheader:
-                subheaders.append(subheader.get_text(strip=True))
-            else:
-                subheaders.append(None)
+    async with aiohttp.ClientSession() as session:
+        for start in range(0, num_results, 10):
+            url = f'https://www.google.com/search?q={query}&start={start}'
 
-            page_url = result.select_one('a')['href']
             try:
-                page_response = requests.get(page_url, headers=headers)
-                page_soup = BeautifulSoup(page_response.text, 'html.parser')
-                h1_tags = [tag.get_text(strip=True) for tag in page_soup.find_all('h1')]
-                h2_tags = [tag.get_text(strip=True) for tag in page_soup.find_all('h2')]
-                h3_tags = [tag.get_text(strip=True) for tag in page_soup.find_all('h3')]
-                keywords_meta = page_soup.find('meta', attrs={'name': 'keywords'})
-                if keywords_meta:
-                    page_keywords = keywords_meta['content'].split(', ')
-                else:
-                    page_keywords = []
-                headings.append({'url': page_url, 'h1': h1_tags, 'h2': h2_tags, 'h3': h3_tags, 'keywords': page_keywords})
-            except:
-                headings.append({'url': page_url, 'error': 'Unable to scrape'})
+                response_text = await fetch(session, url, headers)
+            except Exception as e:
+                print(f"Error while making request: {e}")
+                continue
 
-    return titles, subheaders, headings
+            soup = BeautifulSoup(response_text, 'html.parser')
+            search_results = soup.select('.tF2Cxc')
 
-def generate_new_titles_subheaders(titles, subheaders, headings):
-    new_titles = []
-    new_subheaders = []
-    new_headings = []
+            for result in search_results:
+                title = result.select_one('.LC20lb.DKV0Md').get_text(strip=True)
 
-    all_texts = titles + subheaders
-    words = [word.lower() for word in nltk.word_tokenize(' '.join(all_texts)) if word.isalpha()]
-    bigram_finder = BigramCollocationFinder.from_words(words)
-    bigram_measures = BigramAssocMeasures()
+                subheader = result.select_one('.VwiC3b.yXK7lf.MUxGbd.yDYNvb.lyLwlc')
+                
+                if subheader:
+                    subheader = subheader.get_text(strip=True)    
 
-    bigrams = bigram_finder.nbest(bigram_measures.raw_freq, 100)
+                page_url = result.select_one('a')['href']
+                print(f"Scraping URL: {page_url}")
 
-    for bigram in bigrams:
-        new_title = ' '.join(bigram).title()
-        new_titles.append(new_title)
+                try:
+                    page_response_text = await fetch(session, page_url, headers)
+                    page_soup = BeautifulSoup(page_response_text, 'html.parser')
 
-        new_subheader = f'Learn about {new_title} and its benefits'
-        new_subheaders.append(new_subheader)
+                    
+                    h1_tags = [tag.get_text(strip=True) for tag in page_soup.find_all('h1')]
+                    h2_tags = [tag.get_text(strip=True) for tag in page_soup.find_all('h2')]
+                    h3_tags = [tag.get_text(strip=True) for tag in page_soup.find_all('h3')]
+                    headings = h1_tags + h2_tags + h3_tags
 
-        new_h1 = f'{new_title} Overview'
-        new_h2 = f'What is {new_title}?'
-        new_h3 = f'{new_title} Benefits'
-        new_keywords = f'{new_title}, benefits, overview'
+                    paragraphs = page_soup.find_all('p')
 
-        new_headings.append({'h1': [new_h1], 'h2': [new_h2], 'h3': [new_h3], 'keywords': new_keywords.split(', ')})
+                    # Process paragraphs
+                    paragraph_keywords = []
+                    for paragraph in paragraphs[:num_paragraphs]:
+                        paragraph_text = paragraph.get_text(strip=True)
+                        if len(paragraph_text) < 50:
+                            continue
 
-    return new_titles, new_subheaders, new_headings
+                        keywords = await analyze_text_with_chatgpt(session, paragraph_text)
+                        paragraph_keywords.extend(keywords)
 
-def store_in_mongodb(collection, titles, subheaders, headings=None):
-    for i in range(len(titles)):
-        row = {
-            'title': titles[i],
-            'subheader': subheaders[i]
-        }
-        if headings:
-            row.update({
-                'url': headings[i].get('url', ''),
-                'h1': ', '.join(headings[i].get('h1', [])),
-                'h2': ', '.join(headings[i].get('h2', [])),
-                'h3': ', '.join(headings[i].get('h3', [])),
-                'keywords': ', '.join(headings[i].get('keywords', []))
-            })
-        else:
-            row.update({
-                'url': '',
-                'h1': '',
-                'h2': '',
-                'h3': '',
-                'keywords': ''
-            })
-        collection.insert_one(row)
+                except Exception as e:
+                    print(f"Error while processing result: {e}")
+                    continue
 
-query = 'cbd france'
-titles, subheaders, headings = scrape_search_results(query, num_results=100)
+                scraped_data = {
+                    "url": page_url,
+                    "metadata": {
+                        "title": title,
+                        "subheader": subheader,
+                    },
+                    "content": {
+                        "headings": headings,
+                    },
+                }
 
-store_in_mongodb(scraped_data_collection, titles, subheaders, headings)
+                chatgpt_data = {
+                    "url": page_url,
+                    "analysis": {
+                        "keywords": paragraph_keywords,
+                    },
+                }
 
-new_titles, new_subheaders, new_headings = generate_new_titles_subheaders(titles, subheaders, headings)
+                data.append(scraped_data)
+                scraped_data_collection.insert_one(scraped_data)
+                chatgpt_data_collection.insert_one({"url": page_url, "keywords": paragraph_keywords})
 
-store_in_mongodb(new_data_collection, new_titles, new_subheaders, new_headings)
+    return data
 
-def export_to_csv(filename, titles, subheaders, headings=None):
-    with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-        fieldnames = ['title', 'subheader', 'url', 'h1', 'h2', 'h3', 'keywords']
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for i in range(len(titles)):
-            row = {
-                'title': titles[i],
-                'subheader': subheaders[i]
-            }
-            if headings:
-                row.update({
-                    'url': headings[i].get('url', ''),
-                    'h1': ', '.join(headings[i].get('h1', [])),
-                    'h2': ', '.join(headings[i].get('h2', [])),
-                    'h3': ', '.join(headings[i].get('h3', [])),
-                    'keywords': ', '.join(headings[i].get('keywords', []))
-                })
-            else:
-                row.update({
-                    'url': '',
-                    'h1': '',
-                    'h2': '',
-                    'h3': '',
-                    'keywords': ''
-                })
-            writer.writerow(row)
+if __name__ == "__main__":
+    query = "cbd"
+    num_results = 1
+    num_paragraphs = 3
 
-# Store scraped data to a CSV file
-export_to_csv('scraped_data.csv', titles, subheaders, headings)
+    asyncio.run(scrape_search_results(query, num_results))
 
-# Store generated titles, subheaders, and headings to a separate CSV file
-export_to_csv('new_titles_and_subheaders.csv', new_titles, new_subheaders, new_headings)
+    scraped_data_cursor = scraped_data_collection.find()
+    scraped_data_df = pd.DataFrame(list(scraped_data_cursor))
+
+    print(scraped_data_df.columns)
+    # Multi-level columns for scraped_data_df
+    scraped_data_df = scraped_data_df.drop(columns=['_id'])
+    scraped_data_df.columns = pd.MultiIndex.from_tuples(
+        [("metadata", "title"), ("metadata", "subheader"), ("url", ""), ("content", "headings"), ("metadata_unused", ""), ("content_unused", "")]
+    )
+
+    chatgpt_data_cursor = chatgpt_data_collection.find()
+    chatgpt_data_df = pd.DataFrame(list(chatgpt_data_cursor))
+
+    # Adding the requested code
+    scraped_data_cursor = scraped_data_collection.find({}, {"_id": 0})
+    scraped_data_df = pd.DataFrame(list(scraped_data_cursor))
+    scraped_data_df.to_csv("scraped_data.csv", index=False)
+
+    chatgpt_data_cursor = chatgpt_data_collection.find()
+    chatgpt_data_df = pd.DataFrame(list(chatgpt_data_cursor))
+    
+	# Adding the code to export chatgpt_data to a CSV file
+    chatgpt_data_cursor = chatgpt_data_collection.find({}, {"_id": 0})
+    chatgpt_data_df = pd.DataFrame(list(chatgpt_data_cursor))
+    chatgpt_data_df.to_csv("chatgpt_data.csv", index=False)
